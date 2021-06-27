@@ -3,70 +3,72 @@ module Main exposing (..)
 import Browser
 import Browser.Events
 import Browser.Dom
-import Html exposing (Html)
+import Html exposing (..)
 import Svg exposing (..)
 import Svg.Attributes exposing (..)
-import Svg.Events exposing (on)
+import Svg.Events
 import Time
 import Task
 import Json.Decode
 import Json.Encode
 import Html.Events.Extra.Touch as Touch
 
-main =
-  Browser.element
-    { init = init
-    , view = view
-    , update = update
-    , subscriptions = subscriptions
-    }
-
+-- the whole modifiable program state
 type alias Model =
   { text : String
-  , y : Float
+  , y : Float -- the ball position in visual (svg viewbox) coordinates
   , v : Float
-  , h : Float
-  , lastDragPoint : Maybe Float
-  , width : Float
-  , height : Float
+  , h : Float -- the ground line position in visual coordinates
+  , lastDragPoint : Maybe Float -- y of last drag event, in whatever coordinates as long as scale 100% to viewbox
+  , width : Float -- visual width
+  , height : Float -- visual height
   }
 
-type Msg = Tick Float | Drag Float | StartDrag Float | EndDrag | Resize Int Int
+-- all possible messages to update the program state
+type Msg =
+  Tick Float
+  | Drag Float
+  | StartDrag Float
+  | EndDrag
+  | Resize Int Int
 
 const =
   { radius = 50
-  , spring = 1
-  , gravity = 1
-  , drag = 0 -- 0.1 is reasonable, 0.01 noticeable
+  , spring = 10
+  , gravity = 10
+  , drag = 0 -- if set to nonzero the ball will eventually stop (unrealistically). 0.1 is a reasonable value
+  , rate = 5 -- speed up simulation, for visual purposes
   }
 
-vp2resize : Browser.Dom.Viewport -> Msg
-vp2resize vp = Resize (round vp.viewport.width) (round vp.viewport.height)
+-- initial state and message to be sent at startup
+init () =
+  let
+    initialState = Model "" const.radius 0 0 Nothing 0 0
+    resizeToViewport vp = Resize (round vp.viewport.width) (round vp.viewport.height)
+  in
+    (initialState, Task.perform resizeToViewport Browser.Dom.getViewport)
 
-init : () -> (Model, Cmd Msg)
-init _ = ( Model "" const.radius 0 0 Nothing 0 0, Task.perform vp2resize Browser.Dom.getViewport )
-
+-- perform simulation for 'rt' microsecond of real time
 recalc rt =
   let
-    step dt model =
+    step dt model = -- perform single step of 'dt' microsecond of simulated time
       let
         my = model.y + 0.5 * model.v * dt
-        sy = clamp 0 const.radius (my + const.radius - model.h)
-        fh = -const.spring * sy
-        fd = -model.v * const.drag
+        sy = clamp 0 const.radius (my + const.radius - model.h) -- compression delta
+        fh = -const.spring * sy -- spring force
+        fd = -model.v * const.drag -- viscous drag force
         a = const.gravity + fh + fd
         v = model.v + a * dt
         mv = (model.v + v) * 0.5
         y = model.y + mv * dt
       in
         { model | v = v, y = y }
-    steps dt n model =
-       -- if n == 0 then model else step dt model |> steps dt (n - 1)
-       List.repeat n 0 |> List.foldl (\_ m -> step dt m) model
-    accuracy = 100
+    steps dt n model = -- perform n steps of 'dt' microsecond of simulated time each
+       List.repeat n 0 |> List.foldl (\_ -> step dt) model
   in
-    steps (0.01 / accuracy) (accuracy * round rt)
+    steps 0.001 (const.rate * round rt)
 
+-- format a text line with model state and energy data
 annotate model = 
   let
     h = model.h - model.y
@@ -75,7 +77,7 @@ annotate model =
     sy = clamp 0 const.radius (model.y + const.radius - model.h)
     d = 0.5 * const.spring * sy * sy
     e = k + p + d
-    print = round >> String.fromInt >> String.pad 5 ' '
+    print = round >> String.fromInt >> String.padLeft 5 ' '
     text =
       "h=" ++ print h ++
       " v=" ++ print model.v ++
@@ -84,14 +86,15 @@ annotate model =
       " D=" ++ print d ++
       " E=" ++ print e 
   in { model | text = text }
-     
+
+-- update model according to message (recalc, drag, or resize)
 update msg model =
   let
     save point m = { m | lastDragPoint = Just point }
     drop m = { m | lastDragPoint = Nothing }
-    shift m point lastPoint =
-      { m | h = clamp (const.radius * 1.5) model.height (m.h + point - lastPoint) }
-    newH point lastPoint m = m.h + lastPoint - point
+    minH = const.radius * 1.5
+    maxH = model.height - const.radius * 0.5
+    shift m point lastPoint = { m | h = clamp minH maxH (m.h + point - lastPoint) }
     drag point m = m.lastDragPoint |> Maybe.map (shift m point >> save point) |> Maybe.withDefault m
   in
   (case msg of     
@@ -107,22 +110,21 @@ update msg model =
         { model | width = fw, height = fh, h = fh - const.radius }
   , Cmd.none)
 
-
+-- events from the non-elm world
 subscriptions model = 
   Sub.batch
     [ Browser.Events.onAnimationFrameDelta Tick
     , Browser.Events.onResize Resize ]
 
+-- the html element
 view model =
   let 
-    yRadius =
-      if model.h - model.y > const.radius then const.radius else (model.h - model.y + const.radius) / 2.0
-    yPos =
-      if model.h - model.y > const.radius then model.y else model.h - (model.h - model.y + const.radius) / 2.0
+    yRadius = if model.h - model.y > const.radius then const.radius else (model.h - model.y + const.radius) / 2.0
+    yPos = if model.h - model.y > const.radius then model.y else model.h - (model.h - model.y + const.radius) / 2.0
     withMouseY g = Json.Decode.field "clientY" Json.Decode.float |> Json.Decode.map g
-    withTouchY e = List.head e.changedTouches |> Maybe.map .clientPos |> Maybe.map Tuple.second |> Maybe.withDefault 0
+    withTouchY e = List.head e.changedTouches |> Maybe.map (.clientPos >> Tuple.second) |> Maybe.withDefault 0
   in
-    Html.div [] [
+    div [] [
       svg
         [ viewBox ("0 0 " ++ String.fromFloat model.width ++ " " ++ String.fromFloat model.height)
         , width (String.fromFloat model.width)
@@ -153,6 +155,14 @@ view model =
           , strokeWidth "4"]
           []
         ]
-      , Html.pre [] [text model.text]
+      , pre [] [Html.text model.text]
       ]
+
+main =
+  Browser.element
+    { init = init
+    , view = view
+    , update = update
+    , subscriptions = subscriptions
+    }
 
